@@ -1,15 +1,6 @@
 # Whiteout Survival Gift Code Redemption Script
 
-Just a simple Python script that automates the process of redeeming gift codes in the game **Whiteout Survival**. It reads a list of Player IDs from a `.csv` file, sends requests to the game's giftcode redemption API, and redeems the specified gift code for each player.
-
----
-
-## Features
-
-- **CSV Import**: Reads player IDs from a `.csv` file. Each ID should be on a new line.
-- **Command-Line Interface**: Accepts the `.csv` file path and gift code as arguments.
-- **Error Handling**: Provides clear error messages for missing or invalid inputs.
-- **Rate Limiting**: Adds a delay between requests to avoid triggering rate limits.
+Python script that automates the process of redeeming gift codes in the game **Whiteout Survival**. It reads a list of Player IDs from a `.csv` file and sends requests to the game's giftcode redemption API to redeem the specified gift code for each player.
 
 ---
 
@@ -20,6 +11,8 @@ Just a simple Python script that automates the process of redeeming gift codes i
    ```bash
    pip install requests
    ```
+   Note the pip command should be available automatically after installing Python.
+   
 ---
 
 ## Setup
@@ -29,9 +22,11 @@ Just a simple Python script that automates the process of redeeming gift codes i
    git clone https://github.com/justncodes/wos-giftcode.git
    cd wos-giftcode
    ```
-
+   ...or just download the [redeem_codes.py](https://github.com/justncodes/wos-giftcode/blob/main/redeem_codes.py) file directly.
+   
 2. **Prepare the CSV File**:
-   - Create a `.csv` file (e.g., `player_ids.csv`) with one player ID per row.
+   - Create a `.csv` file (e.g., `player_ids.csv`), ideally in the same folder as the script, with one player ID per row.
+   - You can use your favorite notepad and just save the text file with .csv extension.
    - Example `player_ids.csv`:
      ```csv
      57845354
@@ -51,7 +46,7 @@ python redeem_codes.py --csv <path_to_csv> --code <gift_code>
 
 ### Arguments
 
-- `--csv`: Path to the `.csv` file containing player IDs.
+- `--csv`: Name of the `.csv` file containing player IDs. Add the path to it if it isn't in the same folder as the script.
 - `--code`: The gift code to redeem.
 
 ### Example
@@ -67,13 +62,14 @@ python redeem_codes.py --csv player_ids.csv --code ILoveU
 ### Successful Run
 
 ```plaintext
-Loaded 3 player IDs from player_ids.csv.
-Processing Player ID: 57845354...
-Result: SUCCESS
-Processing Player ID: 98765432...
-Result: RECEIVED.
-Processing Player ID: 12345678...
-Result: SUCCESS
+=== Starting redemption for gift code: woshjm25 at 2025-02-21 19:31:04 ===
+2025-02-21 19:31:04 - Loaded 95 player IDs from SIR.csv
+2025-02-21 19:31:05 - Processing منتظر (52383226)
+2025-02-21 19:31:06 - Result: Successfully redeemed
+2025-02-21 19:31:07 - Processing a_toofargone (51728185)
+2025-02-21 19:31:08 - Result: Successfully redeemed
+2025-02-21 19:31:09 - Processing Aarav Rahul (50646449)
+2025-02-21 19:31:10 - Result: Already redeemed
 ```
 
 ---
@@ -83,14 +79,18 @@ Result: SUCCESS
 1. **CSV Import**:
    - The script reads player IDs from the specified `.csv` file.
 
-2. **API Requests**:
+2. **Sign Generation**:
+   - Uses a secret key (`WOS_ENCRYPT_KEY`) to generate the `sign` parameter for each request.
+
+3. **API Requests**:
    - Sends a login request to validate the player ID.
    - Sends a redemption request to redeem the gift code.
 
-3. **Sign Generation**:
-   - Uses a secret key (`WOS_ENCRYPT_KEY`) to generate a `sign` parameter for each request.
+4. **Verbose Logging**:
+   - Logs output and any errors that occur to redeemed_codes.txt log file.
+   - Retries up to 3 times if the initial attempt fails, unless the code expired.
 
-4. **Rate Limiting**:
+5. **Rate Limiting**:
    - Adds a 1-second delay between requests to avoid being blocked.
 
 ---
@@ -107,19 +107,23 @@ Result: SUCCESS
    - Verify that the gift code is correct and has not expired.
 
 3. **API Rate Limiting**:
-   - If the script is blocked, increase the delay between requests (`time.sleep(2)`).
+   - If the script is blocked, increase the delay between requests (eg. `DELAY = 2`).
 
 ---
 
 ## Future Enhancements
 
-- **Logging**: Add logging to track successful and failed redemptions.
-- **Retry Logic**: Implement retries for failed requests.
 - **GUI**: Create a simple graphical interface for non-technical users.
 
 ---
 
 ## Changelog
+
+### v2.0.0 (Current)
+- Added retry functionality if redemption fails.
+- Added logging to a redeemed_codes.txt log file.
+- Included player names in the log output.
+- Additional error handling.
 
 ### v1.0.0 (Initial Release)
 - Added support for CSV import and command-line arguments.
