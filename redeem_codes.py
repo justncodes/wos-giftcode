@@ -347,6 +347,50 @@ RESULT_MESSAGES = {
     "NOT LOGIN": "Not Logged In / Session Expired",
 }
 
+
+def create_empty_counters():
+    return {
+        "success": 0,
+        "already_redeemed": 0,
+        "errors": 0,
+        "captcha_fetch_attempts": 0,
+        "captcha_ocr_attempts": 0,
+        "captcha_ocr_success": 0,
+        "captcha_ocr_success_cc": 0,
+        "captcha_ocr_success_easyocr": 0,
+        "captcha_ocr_success_ddddocr": 0,
+        "captcha_ocr_success_onnx": 0,
+        "captcha_redeem_success": 0,
+        "captcha_redeem_failure": 0,
+        "captcha_rate_limited": 0,
+    }
+
+
+def reset_runtime_state(player_ids=None):
+    global counters, error_details, script_start_time, all_player_ids
+    counters = create_empty_counters()
+    error_details = {}
+    script_start_time = time.time()
+    all_player_ids = [] if player_ids is None else list(player_ids)
+
+
+def classify_result_status(raw_msg, is_queued_for_retry=False):
+    if is_queued_for_retry:
+        return "retry"
+    if raw_msg == "SUCCESS":
+        return "success"
+    if raw_msg == "RECEIVED":
+        return "already_redeemed"
+    if raw_msg == "SAME TYPE EXCHANGE":
+        return "same_type_exchange"
+    if raw_msg == "TIME ERROR":
+        return "expired"
+    if raw_msg == "USED":
+        return "claim_limit_reached"
+    if raw_msg in ["CAPTCHA CHECK TOO FREQUENT", "In cooldown", "Server requested retry", "TIMEOUT RETRY"]:
+        return "retry"
+    return "failed"
+
 counters = {
     "success": 0,
     "already_redeemed": 0,
@@ -366,6 +410,7 @@ counters = {
 error_details = {} # Stores FID -> last error message
 
 script_start_time = time.time()
+all_player_ids = []
 
 def preprocess_captcha_for_easyocr(image_np):
     """Apply multiple preprocessing techniques tailored for EasyOCR"""
@@ -1252,6 +1297,136 @@ def print_summary():
 
     log(f"\nTotal execution time: {execution_time}")
     log("="*70)
+
+
+def run_redemption_for_ids(player_ids, code):
+    normalized_player_ids = sorted(
+        {str(fid).strip() for fid in player_ids if str(fid).strip().isdigit()},
+        key=int,
+    )
+
+    reset_runtime_state(normalized_player_ids)
+
+    if not normalized_player_ids:
+        return {
+            "code": code,
+            "stop_reason": None,
+            "results": {},
+            "summary": {"success": 0, "already_redeemed": 0, "errors": 0},
+            "error": "No valid player IDs provided",
+        }
+
+    original_code = args.code
+    args.code = code
+
+    retry_queue = {}
+    processed_fids = set()
+    stop_processing = False
+    stop_reason = None
+    result_map = {}
+
+    try:
+        log(f"Total unique valid player IDs to process: {len(all_player_ids)}")
+
+        while len(processed_fids) < len(all_player_ids) and not stop_processing:
+            current_time = time.time()
+            processed_in_this_cycle = 0
+            fids_to_process_now = []
+            fids_in_cooldown_count = 0
+
+            for fid in all_player_ids:
+                if fid in processed_fids:
+                    continue
+                if fid in retry_queue and retry_queue[fid] > current_time:
+                    fids_in_cooldown_count += 1
+                else:
+                    fids_to_process_now.append(fid)
+
+            if not fids_to_process_now and fids_in_cooldown_count > 0:
+                next_retry_time = min(
+                    retry_queue[fid]
+                    for fid in all_player_ids
+                    if fid not in processed_fids and fid in retry_queue
+                )
+                wait_time = max(1, min(30, next_retry_time - current_time + 1))
+                log(f"{fids_in_cooldown_count} FIDs in cooldown. Waiting {int(wait_time)}s... Progress: {len(processed_fids)}/{len(all_player_ids)}")
+                time.sleep(wait_time)
+                continue
+
+            if not fids_to_process_now and fids_in_cooldown_count == 0:
+                log("Warning: No FIDs to process now and none in cooldown, but not all FIDs are processed. Check logic.")
+                break
+
+            log(f"\n--- Starting processing cycle. Ready FIDs: {len(fids_to_process_now)} ---")
+            for fid in fids_to_process_now:
+                if fid in processed_fids:
+                    continue
+                if stop_processing:
+                    break
+
+                result, retry_queue = redeem_gift_code(fid, args.code, retry_queue)
+                processed_in_this_cycle += 1
+
+                raw_msg = result.get('msg', 'Unknown error').strip('.')
+                friendly_msg = RESULT_MESSAGES.get(raw_msg, raw_msg)
+                is_queued_for_retry = fid in retry_queue and retry_queue[fid] > time.time()
+                is_final_state = not is_queued_for_retry
+                status = classify_result_status(raw_msg, is_queued_for_retry)
+
+                if is_final_state:
+                    processed_fids.add(fid)
+                    if raw_msg in ["SUCCESS", "SAME TYPE EXCHANGE"]:
+                        counters["success"] += 1
+                    elif raw_msg == "RECEIVED":
+                        counters["already_redeemed"] += 1
+                    elif raw_msg not in ["TIME ERROR", "USED", "Invalid FID format", "In cooldown", "CAPTCHA CHECK TOO FREQUENT"]:
+                        counters["errors"] += 1
+                        error_details[fid] = friendly_msg
+
+                result_map[fid] = {
+                    "raw_msg": raw_msg,
+                    "friendly_msg": friendly_msg,
+                    "status": status,
+                    "is_final": is_final_state,
+                    "nickname": result.get("nickname"),
+                }
+
+                if raw_msg == "TIME ERROR":
+                    log("\n *** Code has expired! Stopping further processing. ***")
+                    stop_processing = True
+                    stop_reason = raw_msg
+                elif raw_msg == "USED":
+                    log("\n *** Claim limit reached! Stopping further processing. ***")
+                    stop_processing = True
+                    stop_reason = raw_msg
+
+                if not stop_processing:
+                    time.sleep(DELAY + random.uniform(0, 0.5))
+
+            log(f"--- Processing cycle finished. Processed {processed_in_this_cycle} FIDs in this cycle. Total processed: {len(processed_fids)}/{len(all_player_ids)} ---")
+
+        for fid in all_player_ids:
+            if fid not in result_map:
+                result_map[fid] = {
+                    "raw_msg": stop_reason or "SKIPPED",
+                    "friendly_msg": RESULT_MESSAGES.get(stop_reason or "SKIPPED", stop_reason or "Skipped"),
+                    "status": "skipped",
+                    "is_final": False,
+                    "nickname": None,
+                }
+
+        return {
+            "code": code,
+            "stop_reason": stop_reason,
+            "results": result_map,
+            "summary": {
+                "success": counters["success"],
+                "already_redeemed": counters["already_redeemed"],
+                "errors": counters["errors"],
+            },
+        }
+    finally:
+        args.code = original_code
 
 if __name__ == "__main__":
     start_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

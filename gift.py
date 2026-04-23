@@ -6,14 +6,14 @@ Manages player IDs (from player_ids.csv) and gift codes, with batch redemption c
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 CONFIG_FILE = Path(__file__).parent / "cdk.json"
 PLAYER_IDS_FILE = Path(__file__).parent / "player_ids.csv"
+CACHE_FILE = Path(__file__).parent / "redeem_cache.json"
 
 # Try to import redeem_codes for nickname fetching
 REDEEM_CODES_AVAILABLE = False
@@ -31,6 +31,28 @@ except SystemExit:
 except Exception as e:
     sys.argv = _old_argv
     pass
+
+
+TERMINAL_CACHE_STATUSES = {"success", "already_redeemed", "same_type_exchange"}
+STOP_ALL_CODE_STATUSES = {"expired", "claim_limit_reached"}
+
+
+def empty_cache() -> Dict[str, dict]:
+    return {
+        "__meta__": {"baseline_seeded": False},
+        "codes": {},
+    }
+
+
+def normalize_cache(data: object) -> Dict[str, dict]:
+    if isinstance(data, dict) and "codes" in data and "__meta__" in data:
+        return data
+    if isinstance(data, dict):
+        return {
+            "__meta__": {"baseline_seeded": True, "migrated_legacy": True},
+            "codes": data,
+        }
+    return empty_cache()
 
 
 def get_nickname(player_id: str) -> Optional[str]:
@@ -82,6 +104,72 @@ def save_cdks(cdks: List[str]) -> None:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
+def load_cache() -> Dict[str, Dict[str, dict]]:
+    if CACHE_FILE.exists():
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = normalize_cache(json.load(f))
+        return ensure_baseline_cache_seeded(cache)
+    return ensure_baseline_cache_seeded(empty_cache())
+
+
+def save_cache(cache: Dict[str, Dict[str, dict]]) -> None:
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+def ensure_baseline_cache_seeded(cache: Dict[str, Dict[str, dict]]) -> Dict[str, Dict[str, dict]]:
+    meta = cache.setdefault("__meta__", {})
+    code_buckets = cache.setdefault("codes", {})
+    if meta.get("baseline_seeded"):
+        return cache
+
+    player_ids = load_player_ids()
+    cdks = load_cdks()
+    for code in cdks:
+        code_bucket = code_buckets.setdefault(code, {})
+        for player_id in player_ids:
+            code_bucket.setdefault(
+                player_id,
+                {
+                    "status": "already_redeemed",
+                    "raw_msg": "BASELINE_CACHE_SEEDED",
+                    "friendly_msg": "Seeded from existing configuration",
+                    "nickname": None,
+                    "is_final": True,
+                },
+            )
+
+    meta["baseline_seeded"] = True
+    meta["baseline_player_count"] = len(player_ids)
+    meta["baseline_cdk_count"] = len(cdks)
+    save_cache(cache)
+    return cache
+
+
+def get_cached_entry(cache: Dict[str, Dict[str, dict]], code: str, player_id: str) -> Optional[dict]:
+    return cache.get("codes", {}).get(code, {}).get(player_id)
+
+
+def update_cache_entry(cache: Dict[str, Dict[str, dict]], code: str, player_id: str, result: dict) -> None:
+    code_bucket = cache.setdefault("codes", {}).setdefault(code, {})
+    code_bucket[player_id] = {
+        "status": result.get("status", "failed"),
+        "raw_msg": result.get("raw_msg"),
+        "friendly_msg": result.get("friendly_msg"),
+        "nickname": result.get("nickname"),
+        "is_final": result.get("is_final", False),
+    }
+
+
+def redeem_code_for_ids(code: str, player_ids: List[str]) -> Optional[dict]:
+    if not REDEEM_CODES_AVAILABLE:
+        return None
+    try:
+        return redeem_codes.run_redemption_for_ids(player_ids, code)
+    except Exception:
+        return None
+
+
 def validate_cdk_with_sample_id(code: str) -> (bool, str):
     """Validate a CDK by trying to redeem it with one sample player ID."""
     player_ids = load_player_ids()
@@ -89,63 +177,22 @@ def validate_cdk_with_sample_id(code: str) -> (bool, str):
         return False, "没有可用于校验的ID，请先添加至少一个ID"
 
     sample_id = player_ids[0]
-    temp_csv = Path(__file__).parent / "temp_validate_id.csv"
+    redemption_result = redeem_code_for_ids(code, [sample_id])
+    if not redemption_result:
+        return False, "校验异常: 无法调用 redeem_codes 接口"
 
-    try:
-        with open(temp_csv, 'w', encoding='utf-8') as f:
-            f.write(sample_id)
+    sample_result = redemption_result.get("results", {}).get(sample_id)
+    if not sample_result:
+        return False, f"校验异常: 未拿到测试ID {sample_id} 的结果"
 
-        cmd = [
-            sys.executable,
-            "redeem_codes.py",
-            "--code", code,
-            "--csv", str(temp_csv)
-        ]
-        result = subprocess.run(
-            cmd,
-            cwd=Path(__file__).parent,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='ignore'
-        )
+    status = sample_result.get("status")
+    friendly_msg = sample_result.get("friendly_msg") or sample_result.get("raw_msg") or "Unknown"
 
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-        output_lower = output.lower()
-
-        # Positive signals: code is usable for at least one account.
-        positive_markers = [
-            "Successfully redeemed",
-            "Already redeemed",
-            "Successfully redeemed (same type)",
-        ]
-        if any(marker in output for marker in positive_markers):
-            return True, f"校验通过（测试ID: {sample_id}）"
-
-        # Negative signals: code is likely invalid/expired/exhausted.
-        negative_markers = [
-            "Code has expired",
-            "Claim limit reached",
-            "invalid code",
-            "not found",
-            "time error",
-            "used",
-        ]
-        if any(marker.lower() in output_lower for marker in negative_markers):
-            return False, f"校验失败，CDK可能无效或已过期（测试ID: {sample_id}）"
-
-        if result.returncode != 0:
-            return False, f"校验失败，redeem_codes.py 返回非0状态码: {result.returncode}"
-
-        return False, f"校验结果不明确，暂不加入（测试ID: {sample_id}）"
-    except Exception as e:
-        return False, f"校验异常: {e}"
-    finally:
-        try:
-            if temp_csv.exists():
-                temp_csv.unlink()
-        except Exception:
-            pass
+    if status in TERMINAL_CACHE_STATUSES:
+        return True, f"校验通过（测试ID: {sample_id}, 结果: {friendly_msg}）"
+    if status in STOP_ALL_CODE_STATUSES:
+        return False, f"校验失败（测试ID: {sample_id}, 结果: {friendly_msg}）"
+    return False, f"校验结果不明确（测试ID: {sample_id}, 结果: {friendly_msg}）"
 
 
 def add_id(player_id: str) -> None:
@@ -173,6 +220,12 @@ def delete_id(player_id: str) -> None:
         return
     player_ids.remove(player_id)
     save_player_ids(player_ids)
+
+    cache = load_cache()
+    for code_bucket in cache.get("codes", {}).values():
+        code_bucket.pop(player_id, None)
+    save_cache(cache)
+
     print(f"[成功] 已删除 ID: {player_id}")
 
 
@@ -201,11 +254,16 @@ def delete_cdk(code: str) -> None:
         return
     cdks.remove(code)
     save_cdks(cdks)
+
+    cache = load_cache()
+    cache.get("codes", {}).pop(code, None)
+    save_cache(cache)
+
     print(f"[成功] 已删除 CDK: {code}")
 
 
 def _redeem_cdks(cdk_list: List[str], ids: List[str]) -> None:
-    """Internal function to redeem a list of CDKs for given IDs"""
+    """Internal function to redeem a list of CDKs for given IDs with cache"""
     if not ids:
         print("[错误] 没有配置任何 ID")
         return
@@ -214,38 +272,59 @@ def _redeem_cdks(cdk_list: List[str], ids: List[str]) -> None:
         print("[错误] 没有指定任何 CDK")
         return
     
-    # Use player_ids.csv directly
-    csv_path = PLAYER_IDS_FILE
-    
+    cache = load_cache()
     success_count = 0
     fail_count = 0
+    skipped_count = 0
     
     for cdk in cdk_list:
+        pending_ids = []
+        for player_id in ids:
+            cached_entry = get_cached_entry(cache, cdk, player_id)
+            if cached_entry and cached_entry.get("status") in TERMINAL_CACHE_STATUSES:
+                skipped_count += 1
+                continue
+            pending_ids.append(player_id)
+
+        if not pending_ids:
+            print(f"\n{'='*60}")
+            print(f"[跳过] CDK: {cdk}，所有 ID 都已有完成缓存")
+            print(f"{'='*60}")
+            continue
+
         print(f"\n{'='*60}")
-        print(f"[领取] CDK: {cdk}")
+        print(f"[领取] CDK: {cdk}，待处理 ID {len(pending_ids)}/{len(ids)}")
         print(f"{'='*60}")
-        
-        cmd = [
-            sys.executable,
-            "redeem_codes.py",
-            "--code", cdk,
-            "--csv", str(csv_path)
-        ]
-        
-        try:
-            result = subprocess.run(cmd, cwd=Path(__file__).parent)
-            if result.returncode == 0:
-                success_count += 1
-                print(f"[成功] CDK {cdk} 领取完成")
-            else:
-                fail_count += 1
-                print(f"[失败] CDK {cdk} 领取失败")
-        except Exception as e:
+
+        result = redeem_code_for_ids(cdk, pending_ids)
+        if not result:
             fail_count += 1
-            print(f"[错误] 执行命令失败: {e}")
+            print(f"[错误] CDK {cdk} 调用 redeem_codes 接口失败")
+            continue
+
+        code_failed = False
+        for player_id, player_result in result.get("results", {}).items():
+            update_cache_entry(cache, cdk, player_id, player_result)
+            status = player_result.get("status")
+            if status in TERMINAL_CACHE_STATUSES:
+                success_count += 1
+            elif status in STOP_ALL_CODE_STATUSES:
+                fail_count += 1
+                code_failed = True
+            elif status == "retry":
+                fail_count += 1
+            elif status == "failed":
+                fail_count += 1
+
+        save_cache(cache)
+
+        if code_failed:
+            print(f"[停止] CDK {cdk} 已出现全局终止状态: {result.get('stop_reason')}")
+        else:
+            print(f"[完成] CDK {cdk} 本轮处理完成")
     
     print(f"\n{'='*60}")
-    print(f"[完成] 成功: {success_count}, 失败: {fail_count}")
+    print(f"[完成] 成功: {success_count}, 失败: {fail_count}, 跳过: {skipped_count}")
     print(f"{'='*60}")
 
 
@@ -289,6 +368,8 @@ def list_all() -> None:
     """List all configured IDs and CDKs"""
     player_ids = load_player_ids()
     cdks = load_cdks()
+    cache = load_cache()
+    cache_meta = cache.get("__meta__", {})
     
     print("\n[当前配置]")
     print(f"{'─'*60}")
@@ -310,6 +391,9 @@ def list_all() -> None:
             print(f"  • {cdk}")
     else:
         print("\n常驻 CDKs: 无")
+
+    print(f"\n缓存文件: {CACHE_FILE.name}")
+    print(f"基线缓存已初始化: {'是' if cache_meta.get('baseline_seeded') else '否'}")
     
     print(f"{'─'*60}\n")
 
