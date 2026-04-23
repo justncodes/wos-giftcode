@@ -6,6 +6,7 @@ Manages player IDs (from player_ids.csv) and gift codes, with batch redemption c
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -176,7 +177,7 @@ def validate_cdk_with_sample_id(code: str) -> (bool, str):
     if not player_ids:
         return False, "没有可用于校验的ID，请先添加至少一个ID"
 
-    sample_id = player_ids[0]
+    sample_id = random.choice(player_ids)
     redemption_result = redeem_code_for_ids(code, [sample_id])
     if not redemption_result:
         return False, "校验异常: 无法调用 redeem_codes 接口"
