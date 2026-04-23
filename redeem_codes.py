@@ -17,6 +17,7 @@ import base64
 import cv2
 import re
 import numpy as np
+from urllib.parse import urlencode
 from datetime import datetime, timedelta
 from glob import glob
 from PIL import Image, ImageEnhance, ImageFilter
@@ -901,8 +902,19 @@ def log(message, level='info', to_file=True):
 def encode_data(data):
     secret = WOS_ENCRYPT_KEY
     sorted_keys = sorted(data.keys())
-    encoded_data = "&".join([f"{key}={json.dumps(data[key]) if isinstance(data[key], dict) else data[key]}" for key in sorted_keys])
-    return {"sign": hashlib.md5(f"{encoded_data}{secret}".encode()).hexdigest(), **data}
+
+    serialized_items = []
+    for key in sorted_keys:
+        value = data[key]
+        if isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            value = str(value)
+        serialized_items.append((key, value))
+
+    encoded_data = urlencode(serialized_items, encoding='utf-8')
+    sign = hashlib.md5(f"{encoded_data}{secret}".encode('utf-8')).hexdigest()
+    return f"{encoded_data}&sign={sign}"
 
 def make_request(url, payload, headers=None):
     session = requests.Session()
