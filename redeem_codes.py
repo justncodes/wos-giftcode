@@ -71,11 +71,11 @@ except ImportError:
 warnings.filterwarnings("ignore", message=".*pin_memory.*", category=UserWarning)
 
 # Global Configuration
-BASE_URL = "https://wos-giftcode-api.centurygame.com"
+BASE_URL = "https://wjdr-giftcode-api.campfiregames.cn"
 LOGIN_URL = BASE_URL + "/api/player"
 CAPTCHA_URL = BASE_URL + "/api/captcha"
 REDEEM_URL = BASE_URL + "/api/gift_code"
-WOS_ENCRYPT_KEY = "tB87#kPtkxqOS2"
+WOS_ENCRYPT_KEY = "Uiv#87#SPan.ECsp"
 
 DELAY = 1
 RETRY_DELAY = 2
@@ -868,8 +868,8 @@ def make_request(url, payload, headers=None):
         'Accept-Encoding': 'gzip, deflate, br, zstd',
         'Accept-Language': 'en-US,en;q=0.9',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Origin': 'https://wos-giftcode.centurygame.com',
-        'Referer': 'https://wos-giftcode.centurygame.com/',
+        'Origin': 'https://wjdr-giftcode.centurygames.cn',
+        'Referer': 'https://wjdr-giftcode.centurygames.cn/',
         'sec-ch-ua': f'"Not:A-Brand";v="99", "Google Chrome";v="{version}", "Chromium";v="{version}"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
@@ -907,6 +907,38 @@ def make_request(url, payload, headers=None):
             time.sleep(RETRY_DELAY * (attempt + 1))
 
     return None
+
+def get_nickname(fid):
+    if not str(fid).strip().isdigit():
+        log(f"Skipping invalid FID format: '{fid}'")
+        return {"msg": "Invalid FID format"}
+    fid = str(fid).strip()
+    
+    current_time = time.time()
+
+    captcha_code_sent = None
+    temp_image_path_final = None
+    final_redeem_data = {"msg": "Processing Error"}
+    ocr_method_succeeded = "None"
+    
+    # --- Login Step ---
+    try:
+        login_payload = encode_data({"fid": fid, "time": int(time.time() * 1000)})
+        login_resp = make_request(LOGIN_URL, login_payload)
+        if not login_resp:
+            log(f"Login request failed for FID {fid} after retries.")
+            return {"msg": "Login request failed"}
+        login_data = login_resp.json()
+        if login_data.get("code") != 0:
+            login_msg = login_data.get('msg', 'Unknown login error')
+            log(f"{nickname} ({fid}) - Login failed: Code {login_data.get('code')}, Msg: {login_msg}", level='error')
+            return {"msg": f"Login failed: {login_msg}"}
+        nickname = login_data.get("data", {}).get("nickname", "Unknown Player")
+        return {"msg": "Success", "nickname": nickname}
+    except Exception as login_err:
+        log(f"{fid} - Unexpected error during login phase: {login_err}", level='error')
+        return {"msg": f"Unexpected Login Error: {login_err}"}
+    
 
 def redeem_gift_code(fid, cdk, retry_queue=None):
     """Redeems a gift code, handling captcha and saving the image based on result."""
