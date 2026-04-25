@@ -971,13 +971,6 @@ def get_nickname(fid):
         return {"msg": "Invalid FID format"}
     fid = str(fid).strip()
     
-    current_time = time.time()
-
-    captcha_code_sent = None
-    temp_image_path_final = None
-    final_redeem_data = {"msg": "Processing Error"}
-    ocr_method_succeeded = "None"
-    
     # --- Login Step ---
     try:
         login_payload = encode_data({"fid": fid, "time": int(time.time() * 1000)})
