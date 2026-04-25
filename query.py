@@ -25,7 +25,7 @@ WOS_ENCRYPT_KEY = "Uiv#87#SPan.ECsp"
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "id_name_map.json")
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 4
-RETRY_DELAY = 1.5
+RETRY_DELAY = 3
 
 
 def now_str():
@@ -152,7 +152,7 @@ def migrate_record_schema(record):
         record.pop("aliases", None)
 
 
-def append_remark_if_needed(record, remark):
+def append_remark_if_needed(record, remark, only_check_latest=False):
     if remark is None:
         return False
 
@@ -160,17 +160,39 @@ def append_remark_if_needed(record, remark):
     if not remark:
         return False
 
-    for item in record.get("remarks", []):
-        if item.get("remark") == remark:
-            return False
+    remarks = record.setdefault("remarks", [])
 
-    record.setdefault("remarks", []).append(
+    if only_check_latest:
+        if remarks:
+            latest = remarks[-1]
+            latest_text = latest.get("remark") if isinstance(latest, dict) else latest
+            if latest_text == remark:
+                return False
+    else:
+        for item in remarks:
+            text = item.get("remark") if isinstance(item, dict) else item
+            if text == remark:
+                return False
+
+    remarks.append(
         {
             "remark": remark,
             "created_at": now_str(),
         }
     )
     return True
+
+
+def build_auto_remark(nickname, alliance=None):
+    name = (nickname or "").strip()
+    if not name:
+        return ""
+
+    alliance_name = (alliance or "").strip()
+    if alliance_name:
+        return f"{alliance_name} {name}"
+
+    return name
 
 
 def validate_ids(raw_ids):
@@ -196,15 +218,28 @@ def cmd_add(args):
 
         record = ensure_record(db, fid)
         migrate_record_schema(record)
-        added_remark = append_remark_if_needed(record, args.remark)
+
+        manual_remark = args.remark.strip() if isinstance(args.remark, str) else ""
+        if manual_remark:
+            added_remark = append_remark_if_needed(record, manual_remark)
+        else:
+            auto_remark = build_auto_remark(current_name, args.alliance)
+            # If no manual remark is provided, keep the latest remark synced with current nickname.
+            added_remark = append_remark_if_needed(
+                record,
+                auto_remark,
+                only_check_latest=True,
+            )
 
         record["current_name"] = current_name
         record["last_checked_at"] = now_str()
         record["updated_at"] = now_str()
 
         message = f"ID {fid}: current='{current_name}'"
-        if args.remark:
-            message += f", remark='{args.remark}'"
+        if manual_remark:
+            message += f", remark='{manual_remark}'"
+        elif added_remark:
+            message += f", auto_remark='{auto_remark}'"
         if added_remark:
             message += " (new remark)"
         log(message)
@@ -242,8 +277,12 @@ def render_record(fid, record):
 
 
 def cmd_query(args):
+    if (args.refresh_dry_run or args.refresh_changes_only) and not args.refresh:
+        args.refresh = True
+
     db = load_db(args.db)
     records = db.get("records", {})
+    changed_items = []
 
     if args.ids:
         ids = [str(x).strip() for x in args.ids]
@@ -273,20 +312,69 @@ def cmd_query(args):
 
         migrate_record_schema(record)
 
+        display_record = record
+        name_changed = False
+
         if args.refresh:
             current_name, err = fetch_current_nickname(fid)
             if err:
                 log(f"ID {fid}: refresh failed ({err})")
             else:
-                record["current_name"] = current_name
-                record["last_checked_at"] = now_str()
-                record["updated_at"] = now_str()
+                old_name = (record.get("current_name") or "").strip()
+                new_name = (current_name or "").strip()
+                name_changed = new_name != old_name
 
-        render_record(fid, record)
+                if name_changed:
+                    changed_items.append(
+                        {
+                            "fid": fid,
+                            "old_name": old_name,
+                            "new_name": new_name,
+                        }
+                    )
+
+                if args.refresh_dry_run:
+                    display_record = {
+                        "current_name": current_name,
+                        "remarks": [
+                            dict(item) if isinstance(item, dict) else item for item in (record.get("remarks") or [])
+                        ],
+                        "last_checked_at": now_str(),
+                        "updated_at": now_str(),
+                    }
+                else:
+                    display_record = record
+
+                # During refresh, only update auto remark when nickname changed.
+                if new_name and new_name != old_name:
+                    append_remark_if_needed(display_record, new_name, only_check_latest=True)
+
+                display_record["current_name"] = current_name
+                display_record["last_checked_at"] = now_str()
+                display_record["updated_at"] = now_str()
+
+        if args.refresh and args.refresh_changes_only and not name_changed:
+            continue
+
+        render_record(fid, display_record)
 
     if args.refresh:
-        save_db(args.db, db)
-        log("Refresh completed and saved.")
+        if args.refresh_dry_run:
+            log("Refresh dry-run completed. No DB changes were saved.")
+        else:
+            save_db(args.db, db)
+            log("Refresh completed and saved.")
+
+        print("refresh_change_summary:")
+        if changed_items:
+            print(f"  changed_ids({len(changed_items)}): {', '.join(item['fid'] for item in changed_items)}")
+            print("  details:")
+            for item in changed_items:
+                old_name = item["old_name"] if item["old_name"] else "-"
+                new_name = item["new_name"] if item["new_name"] else "-"
+                print(f"    {item['fid']}: '{old_name}' -> '{new_name}'")
+        else:
+            print("  changed_ids(0): -")
 
 
 def cmd_data(args):
@@ -408,11 +496,29 @@ def build_parser():
     p_add = sub.add_parser("add", help="Add/update ID mapping using current nickname, with optional remark")
     p_add.add_argument("--ids", nargs="+", required=True, help="One or more numeric IDs")
     p_add.add_argument("--remark", default=None, help="Optional note for this ID")
+    p_add.add_argument(
+        "--alliance",
+        "--ally",
+        "-A",
+        dest="alliance",
+        default=None,
+        help="Optional alliance name for auto remark; combined as '<alliance> <nickname>' when --remark is not set",
+    )
     p_add.set_defaults(func=cmd_add)
 
     p_query = sub.add_parser("query", help="Query ID mapping: current nickname + historical remarks")
     p_query.add_argument("--ids", nargs="*", help="IDs to query. Omit to query all local records")
     p_query.add_argument("--refresh", action="store_true", help="Refresh current nickname from API before printing")
+    p_query.add_argument(
+        "--refresh-dry-run",
+        action="store_true",
+        help="Preview refresh changes from API without saving DB",
+    )
+    p_query.add_argument(
+        "--refresh-changes-only",
+        action="store_true",
+        help="When refreshing, only print records whose nickname changed",
+    )
     p_query.set_defaults(func=cmd_query)
 
     p_data = sub.add_parser("data", help="Query one ID raw login_resp.json() data field")
